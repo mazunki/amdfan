@@ -6,7 +6,7 @@ import re
 import signal
 import sys
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import yaml
@@ -109,6 +109,18 @@ class Curve:  # pylint: disable=too-few-public-methods
         """
 
         return np.interp(x=temp, xp=self.temps, fp=self.speeds)
+
+    @staticmethod
+    def _validate_matrix_config(points):
+        # TODO: check that values are non-overlapping and increasing
+        if not isinstance(points, list):
+            raise ValueError("speed_matrix must be a list of pairs of numbers")
+        try:
+            for left, right in points:
+                if not isinstance(left, int) or not isinstance(right, int):
+                    raise ValueError
+        except ValueError as e:
+            raise ValueError("each item in speed_matrix must contain two numbers:", e)
 
 
 class Card:
@@ -275,7 +287,10 @@ class FanController:  # pylint: disable=too-few-public-methods
 
     def reload_config(self, *_) -> None:
         LOGGER.info("Received request to reload config")
-        self.load_config()
+        try:
+            self.load_config()
+        except ValueError:
+            LOGGER.warning("Failed to update configuration. Please verify its content, or generate a new one from the defaults. Running with original configuration.")
 
     def terminate(self, *_) -> None:
         LOGGER.info("Shutting down controller")
@@ -284,8 +299,40 @@ class FanController:  # pylint: disable=too-few-public-methods
 
     def load_config(self) -> None:
         LOGGER.info("Loading configuration")
-        config = load_config(self.config_path)
+        required_keys = [
+            "speed_matrix",
+        ]
+        defaults = {
+            "threshold": 0,
+            "frequency": 5,
+            "permit_monitor_only": "never"
+        }
+
+        config = {}
+        raw_config = load_yaml_config_file(self.config_path)
+        for key in required_keys:
+            if raw_config.get(key) is None:
+                raise ValueError("missing required configuration key: " + str(key))
+
+        v = config["speed_matrix"] = raw_config["speed_matrix"]
+        Curve._validate_matrix_config(v)
+
+        v = config["threshold"] = raw_config.get("threshold")
+        if v is not None and not isinstance(v, int):
+            raise ValueError("threshold must be an integer. found " + repr(v))
+
+        v = config["frequency"] = raw_config.get("frequency")
+        if v is not None and not isinstance(v, int):
+            raise ValueError("frequency must be an integer. found " + repr(v))
+
+        v = config["permit_monitor_only"] = raw_config.get("permit_monitor_only")
+        if v not in [None, "always", "never", "auto"]:
+            raise ValueError("permit_monitor_only must be one of 'always', 'never', or 'auto'. found " + repr(v))
+
+        for k in defaults:
+            config.setdefault(k, defaults[k])
         self.apply(config)
+
         LOGGER.info("Configuration succesfully loaded")
 
     def apply(self, config) -> None:
@@ -293,10 +340,11 @@ class FanController:  # pylint: disable=too-few-public-methods
         if len(self._scanner.cards) < 1:
             LOGGER.error("no compatible cards found, exiting")
             sys.exit(1)
-        self._curve = Curve(config.get("speed_matrix"))
-        self._threshold = config.get("threshold", 0)
-        self._frequency = config.get("frequency", 5)
-        self._permit_monitor_only = config.get("permit_monitor_only", "never")
+
+        self._curve = Curve(config["speed_matrix"])
+        self._threshold = config["threshold"]
+        self._frequency = config["frequency"]
+        self._permit_monitor_only = config["permit_monitor_only"]
 
     def main(self) -> None:
         if self._ready_fd is not None:
@@ -434,7 +482,7 @@ class FanController:  # pylint: disable=too-few-public-methods
         LOGGER.info("Goodbye")
 
 
-def load_config(path) -> Callable:
+def load_yaml_config_file(path) -> Dict:
     LOGGER.debug("loading config from %s", path)
     with open(path, encoding="utf8") as config_file:
         return yaml.safe_load(config_file)
