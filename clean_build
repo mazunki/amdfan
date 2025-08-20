@@ -2,6 +2,13 @@
 #
 set -xue -o pipefail
 
+generate_shell_completions() {
+  : # https://click.palletsprojects.com/en/stable/shell-completion/
+
+  mkdir -p ./dist/completions/"${1}"
+  env _AMDFAN_COMPLETE=${1}_source amdfan > dist/completions/"${1}"/"${2:-_amdfan}"
+}
+
 echo "cleaning up previous run"
 rm -rf dist/*.whl dist/*.gz configure config.status autom4te.cache config.log *.gz *.zst *.log
 
@@ -25,6 +32,10 @@ poetry run pytest
 
 echo "running poetry build"
 poetry build
+
+generate_shell_completions zsh
+generate_shell_completions bash
+generate_shell_completions fish
 
 echo "getting the md5sum of the tarball"
 md5sum dist/*.gz
