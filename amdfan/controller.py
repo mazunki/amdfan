@@ -127,29 +127,44 @@ class Card:
 
     def __init__(self, card_id: str) -> None:
         self._id = card_id
+        self.broken_read = False
+        self.broken_write = False
 
         for node in os.listdir(os.path.join(ROOT_DIR, self._id, HWMON_DIR)):
             if re.match(self.HWMON_REGEX, node):
                 self._monitor = node
         self._endpoints = self._load_endpoints()
+        try:
+            self._verify_card()
+        except FileNotFoundError:
+            LOGGER.warning(f"{self._id} is missing expected endpoints!")
 
     def _verify_card(self) -> None:
+        missing = []
         for endpoint in self.AMD_FIELDS:
             if endpoint not in self._endpoints:
-                LOGGER.info("skipping card: %s missing endpoint %s", self._id, endpoint)
-                raise FileNotFoundError
+                missing.append(endpoint)
+
+        if missing:
+            LOGGER.info("card: %s, missing endpoints: %s", self._id, missing)
+            raise FileNotFoundError
 
     def _load_endpoints(self) -> Dict:
         _endpoints = {}
-        _dir = os.path.join(ROOT_DIR, self._id, HWMON_DIR, self._monitor)
-        for endpoint in os.listdir(_dir):
+        self._dir = os.path.join(ROOT_DIR, self._id, HWMON_DIR, self._monitor)
+        for endpoint in os.listdir(self._dir):
             if endpoint not in ("device", "power", "subsystem", "uevent"):
-                _endpoints[endpoint] = os.path.join(_dir, endpoint)
+                _endpoints[endpoint] = os.path.join(self._dir, endpoint)
         return _endpoints
 
     def read_endpoint(self, endpoint: str) -> str:
-        with open(self._endpoints[endpoint], "r", encoding="utf8") as endpoint_file:
-            return endpoint_file.read()
+        try:
+            with open(self._endpoints[endpoint], "r", encoding="utf8") as endpoint_file:
+                return endpoint_file.read()
+        except KeyError as e:
+            LOGGER.error(f"Failed to find endpoint {endpoint} for {self._id}.\nDoes {self._dir} support the requested control?")
+            self.broken_read = True
+            raise ValueError(e)
 
     def write_endpoint(self, endpoint: str, data: int) -> int:
         # debug here, troubleshooting 7900xtx
@@ -157,9 +172,14 @@ class Card:
         try:
             with open(self._endpoints[endpoint], "w", encoding="utf8") as endpoint_file:
                 return endpoint_file.write(str(data))
-        except PermissionError:
+        except PermissionError as e:
             LOGGER.error("Failed writing to devfs file, are you running as root?")
-            sys.exit(1)
+            self.broken_write = False
+            raise e
+        except KeyError as e:
+            LOGGER.error(f"Failed to find endpoint {endpoint} for {self._id}.\nDoes {self._dir} support the requested control?")
+            self.broken_write = True
+            raise ValueError(e)
 
     @property
     def fan_speed(self) -> int:
@@ -181,13 +201,16 @@ class Card:
         return int(self.read_endpoint("pwm1_min"))
 
     def set_system_controlled_fan(self, state: bool) -> None:
-
         system_controlled_fan = 2
         manual_control = 1
 
-        self.write_endpoint(
-            "pwm1_enable", system_controlled_fan if state else manual_control
-        )
+        try:
+            self.write_endpoint(
+                "pwm1_enable", system_controlled_fan if state else manual_control
+            )
+        except (ValueError, PermissionError) as e:
+            LOGGER.warning("Unable to toggle between system and manual control")
+            raise e
 
     def set_fan_speed(self, speed: int) -> int:
         if speed >= 100:
@@ -197,8 +220,11 @@ class Card:
         else:
             speed = int((self.fan_max - self.fan_min) / 100 * speed + self.fan_min)
 
-        self.set_system_controlled_fan(False)
-        return self.write_endpoint("pwm1", speed)
+        try:
+            self.set_system_controlled_fan(False)
+            return self.write_endpoint("pwm1", speed)
+        except (ValueError, PermissionError):
+            raise RuntimeError("Couldn't set fan speed")
 
 
 class Scanner:  # pylint: disable=too-few-public-methods
@@ -270,6 +296,7 @@ class FanController:  # pylint: disable=too-few-public-methods
         self._curve = Curve(config.get("speed_matrix"))
         self._threshold = config.get("threshold", 0)
         self._frequency = config.get("frequency", 5)
+        self._permit_monitor_only = config.get("permit_monitor_only", "never")
 
     def main(self) -> None:
         if self._ready_fd is not None:
@@ -278,14 +305,40 @@ class FanController:  # pylint: disable=too-few-public-methods
         self._running = True
         LOGGER.info("Controller is running")
         while self._running:
-            for name, card in self._scanner.cards.items():
-                # print("refreshing card", name, card)
-                self.refresh_card(name, card)
+            for name in self._scanner.cards:
+                card = self._scanner.cards[name]
+                try:
+                    # print("refreshing card", name, card)
+                    if card.broken_write:
+                        self.refresh_card(name, card, read_only=True)
+                        continue
+
+                    self.refresh_card(name, card)
+                except RuntimeError:
+                    if card.broken_read:
+                        LOGGER.error(f"Removing {name} from runtime as unable to monitor it")
+                        self._scanner.cards.pop(name)
+                    elif card.broken_write:
+                        LOGGER.warning(f"Entering read-only mode for {name}. Only thermal readings will be provided.")
 
             self._stop_event.wait(self._frequency)
+
+            if self._permit_monitor_only == "auto":
+                if all(card.broken_write for card in self._scanner.cards.values()):
+                    LOGGER.info("No cards permit writing. This seems unlikely. Exiting")
+                    break
+            elif self._permit_monitor_only == "never":
+                if any(card.broken_write for card in self._scanner.cards.values()):
+                    LOGGER.info("Found a card in read-only mode. Exiting")
+                    break
+
+            elif self._permit_monitor_only == "always":
+                count = sum(card.broken_write for card in self._scanner.cards.values())
+                LOGGER.info(f"Found {count} cards in read-only mode, from a total of {len(self._scanner.cards)}")
+
         LOGGER.info("Stopped controller")
 
-    def refresh_card(self, name, card):
+    def refresh_card(self, name, card, *, read_only=False):
         # print("refreshing card", name, card)
         apply = True
         temp = card.gpu_temp
@@ -320,13 +373,16 @@ class FanController:  # pylint: disable=too-few-public-methods
             if int(temp) in range(int(low), int(high)):
                 LOGGER.debug("temp in range, doing nothing")
                 apply = False
+            elif read_only:
+                LOGGER.warning("temp out of range, but ignoring it due to read-only. this could be dangerous for your gpu!")
+                return
             else:
                 LOGGER.debug("temp out of range, setting")
                 card.set_fan_speed(speed)
                 self._last_temp = temp
                 return
 
-        if apply:
+        if apply and not read_only:
             card.set_fan_speed(speed)
             self._last_temp = temp
 
