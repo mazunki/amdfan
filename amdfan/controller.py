@@ -137,7 +137,7 @@ class Card:
         try:
             self._verify_card()
         except FileNotFoundError:
-            LOGGER.warning(f"{self._id} is missing expected endpoints!")
+            LOGGER.warning("%s is missing expected endpoints!", self._id)
 
     def _verify_card(self) -> None:
         missing = []
@@ -162,7 +162,7 @@ class Card:
             with open(self._endpoints[endpoint], "r", encoding="utf8") as endpoint_file:
                 return endpoint_file.read()
         except KeyError as e:
-            LOGGER.error(f"Failed to find endpoint {endpoint} for {self._id}.\nDoes {self._dir} support the requested control?")
+            LOGGER.error("Failed to find endpoint %s for %s.\nDoes %s support the requested control?", endpoint, self._id, self._dir)
             self.broken_read = True
             raise ValueError(e)
 
@@ -177,7 +177,7 @@ class Card:
             self.broken_write = False
             raise e
         except KeyError as e:
-            LOGGER.error(f"Failed to find endpoint {endpoint} for {self._id}.\nDoes {self._dir} support the requested control?")
+            LOGGER.error("Failed to find endpoint %s for %s.\nDoes %s support the requested control?", endpoint, self._id, self._dir)
             self.broken_write = True
             raise ValueError(e)
 
@@ -316,10 +316,10 @@ class FanController:  # pylint: disable=too-few-public-methods
                     self.refresh_card(name, card)
                 except RuntimeError:
                     if card.broken_read:
-                        LOGGER.error(f"Removing {name} from runtime as unable to monitor it")
+                        LOGGER.error("Removing %s from runtime as unable to monitor it", name)
                         self._scanner.cards.pop(name)
                     elif card.broken_write:
-                        LOGGER.warning(f"Entering read-only mode for {name}. Only thermal readings will be provided.")
+                        LOGGER.warning("Entering read-only mode for %s. Only thermal readings will be provided.", name)
 
             self._stop_event.wait(self._frequency)
 
@@ -334,7 +334,7 @@ class FanController:  # pylint: disable=too-few-public-methods
 
             elif self._permit_monitor_only == "always":
                 count = sum(card.broken_write for card in self._scanner.cards.values())
-                LOGGER.info(f"Found {count} cards in read-only mode, from a total of {len(self._scanner.cards)}")
+                LOGGER.info("Found %d cards in read-only mode, from a total of %d cards", count, len(self._scanner.cards))
 
         LOGGER.info("Stopped controller")
 
