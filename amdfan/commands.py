@@ -124,6 +124,9 @@ def run_daemon(
         logfile = None
 
     if action:
+        if pidfile is None:
+            raise ValueError("need a pidfile to perform an action on. none was provided.")
+
         try:
             with open(pidfile) as f:
                 pid = int(f.read())
